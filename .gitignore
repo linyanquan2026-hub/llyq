@@ -1,0 +1,10 @@
+# 模型和二进制太大，不进仓库
+models/
+llama/
+llama_vk/
+dist/
+build/
+*.spec
+__pycache__/
+*.log
+*.part
