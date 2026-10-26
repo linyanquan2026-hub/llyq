@@ -1,8 +1,8 @@
 """识别 + 翻译引擎（全离线）。
 
 识别：faster-whisper small.en（CTranslate2，int8，CPU）
-翻译：Helsinki-NLP/opus-mt-en-zh（MarianMT，CPU）
-模型从 hf-mirror.com 下载，只下一次。
+翻译：Qwen2.5-3B-Instruct q4_0 GGUF，走本地 llama-server（HTTP + SSE 流式）
+模型放在 models/ 下，只下一次。
 """
 import os
 import re
@@ -32,8 +32,11 @@ _HALLU = {
 
 def _clean_zh(s: str) -> str:
     s = s.strip()
-    # Marian 有时把中文逐字分开，去掉汉字之间的空格
+    # Marian/Qwen 有时把中文逐字分开，去掉汉字之间的空格
     s = re.sub(r"(?<=[\u4e00-\u9fff])\s+(?=[\u4e00-\u9fff])", "", s)
+    # 中文标点两侧的空格也要吃掉，否则字幕里出现「你好 ，世界」这种缝
+    s = re.sub(r"\s*([，。！？、；：」』）】…—])\s*", r"\1", s)
+    s = re.sub(r"\s*([「『（【])\s*", r"\1", s)
     s = _WS.sub(" ", s).strip()
     return _collapse(s)
 
@@ -116,22 +119,40 @@ class Mt:
 
     def __init__(self, threads=6):
         import atexit
-        import subprocess
         import urllib.request
 
-        base_dir = os.path.dirname(MODELS)          # live-translate 根目录
-        model = os.path.join(MODELS, "qwen", "qwen2.5-3b-instruct-q4_0.gguf")
-        if not os.path.exists(model):
-            raise FileNotFoundError(f"缺少翻译模型：{model}")
-
-        exes = [os.path.join(base_dir, d, "llama-server.exe") for d in ("llama_vk", "llama")]
-        exes = [e for e in exes if os.path.exists(e)]
-        if not exes:
-            raise FileNotFoundError("缺少 llama-server（llama_vk / llama 目录都找不到）")
-
+        self._threads = threads
         self._urllib = urllib.request
         self.proc = None
+        self.port = None
         t0 = time.time()
+
+        # 打包后 __file__ 在 _internal 里，程序目录以 models 的父目录为准
+        prog_dirs = []
+        for d in (os.path.dirname(MODELS), BASE):
+            if d and d not in prog_dirs:
+                prog_dirs.append(d)
+        self._model = os.path.join(MODELS, "qwen", "qwen2.5-3b-instruct-q4_0.gguf")
+        if not os.path.exists(self._model):
+            raise FileNotFoundError(f"缺少翻译模型：{self._model}")
+
+        exes = [os.path.join(d, sub, "llama-server.exe")
+                for d in prog_dirs for sub in ("llama_vk", "llama")]
+        seen = []
+        for e in exes:
+            if os.path.exists(e) and e not in seen:
+                seen.append(e)
+        self._exes = seen
+        if not self._exes:
+            raise FileNotFoundError("缺少 llama-server（llama_vk / llama 目录都找不到）")
+
+        self._launch()
+        print(f"[mt] 就绪 {time.time() - t0:.1f}s（:{self.port}）", flush=True)
+        atexit.register(self.close)
+
+    def _launch(self):
+        """起一个 llama-server：先试复用已有实例，再 GPU，最后 CPU。"""
+        import subprocess
 
         for port in self.PORT_CANDIDATES:
             if self._alive(port):
@@ -140,11 +161,11 @@ class Mt:
                 print(f"[mt] 复用已在跑的 llama-server :{port}", flush=True)
                 return
 
-        for exe in exes:
+        for exe in self._exes:
             gpu = "llama_vk" in exe
             for port in self.PORT_CANDIDATES:
                 try:
-                    args = [exe, "-m", model, "-c", "512", "-t", str(threads),
+                    args = [exe, "-m", self._model, "-c", "512", "-t", str(self._threads),
                             "--port", str(port), "--host", "127.0.0.1", "--no-webui", "--no-warmup"]
                     if gpu:
                         args[-1:-1] = ["-ngl", "99"]     # 显卡全量卸载
@@ -157,13 +178,24 @@ class Mt:
                     continue
                 self.port = port
                 if self._wait_ready(45):
-                    print(f"[mt] 就绪 {time.time() - t0:.1f}s  {'GPU' if gpu else 'CPU'} :{port}",
-                          flush=True)
-                    atexit.register(self.close)
+                    print(f"[mt] {'GPU' if gpu else 'CPU'} :{port} 就绪", flush=True)
                     return
                 print(f"[mt] {'GPU' if gpu else 'CPU'} :{port} 超时，换下一个", flush=True)
                 self.close()
         raise RuntimeError("llama-server 起不来（端口被占或模型损坏）")
+
+    def ensure_alive(self, seconds=30):
+        """健康检查；服务掉了就重启。返回是否可用。"""
+        if self.port and self._alive(self.port):
+            return True
+        print("[mt] 翻译服务不在，重启中…", flush=True)
+        self.close()
+        try:
+            self._launch()
+        except Exception as e:  # noqa: BLE001
+            print(f"[mt] 重启失败：{e}", flush=True)
+            return False
+        return self._alive(self.port) if self.port else False
 
     # ------------------------------------------------------------------ 内部
     def _url(self, port, path):
@@ -204,7 +236,7 @@ class Mt:
         body = json.dumps({
             "messages": [{"role": "system", "content": sys_prompt},
                          {"role": "user", "content": text}],
-            "max_tokens": 120, "temperature": 0.2, "stream": stream,
+            "max_tokens": 200, "temperature": 0.2, "stream": stream,
         }).encode()
         req = self._urllib.Request(self._url(self.port, "/v1/chat/completions"), data=body,
                                    headers={"Content-Type": "application/json"})
@@ -240,7 +272,14 @@ class Mt:
         text = text.strip()
         if not text:
             return ""
-        out = _clean_zh(self._ask(text, on_partial=on_partial))
+        try:
+            out = _clean_zh(self._ask(text, on_partial=on_partial))
+        except Exception as e:  # noqa: BLE001
+            # 服务挂了（显存不足 / 驱动复位 / 端口被抢）：重连一次再问
+            print(f"[mt] 请求失败（{e}），重连后重试", flush=True)
+            if not self.ensure_alive():
+                raise
+            out = _clean_zh(self._ask(text, on_partial=on_partial))
         if re.search(r"[A-Za-z]{2,}", out):          # 还留着英文，重试一次
             try:
                 out2 = _clean_zh(self._ask(text, strict=True))
