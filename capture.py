@@ -1,5 +1,6 @@
 """抓取系统正在播放的声音（WASAPI loopback），切成语音片段。"""
 import collections
+import time
 
 import numpy as np
 
@@ -32,12 +33,12 @@ def _resample(x: np.ndarray, src: int, dst: int) -> np.ndarray:
 
 
 class Loopback:
-    """默认扬声器的回环录音：电脑放什么，就抓什么。"""
+    """默认扬声器的回环录音：电脑放什么，就抓什么。
+
+    设备被拔、默认设备被切、驱动重启时自动重连，不把上层拖死。
+    """
 
     def __init__(self, block=0.1):
-        spk = sc.default_speaker()
-        self.name = spk.name
-        self.mic = sc.get_microphone(id=str(spk.name), include_loopback=True)
         self.block = block
         self.rms = 0.0
         self.threshold = 0.008
@@ -45,8 +46,19 @@ class Loopback:
         self._hist = collections.deque(maxlen=60)
         self._floor = 0.004
         self.sample_rate = SR
+        self.reconnects = 0
+        self.on_level = None          # 每块音频回调一次（给 UI 画电平）
+        self.on_reconnect = None      # 重连时回调一次（给 UI 报状态）
+        self._resolve()
 
-    def blocks(self):
+    def _resolve(self):
+        """重新解析默认扬声器的回环设备（换耳机 / 拔 USB 之后必须重拿）。"""
+        spk = sc.default_speaker()
+        self.name = spk.name
+        self.mic = sc.get_microphone(id=str(spk.name), include_loopback=True)
+        return self.name
+
+    def _blocks_once(self):
         if not self._use_48k:
             try:
                 with self.mic.recorder(samplerate=SR, channels=2,
@@ -54,7 +66,7 @@ class Loopback:
                     while True:
                         data = r.record(numframes=int(SR * self.block))
                         yield np.asarray(data, dtype=np.float32).mean(axis=1)
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"[cap] 16k 不支持（{e}），改用 48k 采后降采样", flush=True)
                 self._use_48k = True
                 self.sample_rate = 48000
@@ -64,6 +76,30 @@ class Loopback:
                 data = r.record(numframes=int(48000 * self.block))
                 mono = np.asarray(data, dtype=np.float32).mean(axis=1)
                 yield _resample(mono, 48000, SR)
+
+    def blocks(self):
+        """无限重连版录音流：只有 GeneratorExit 才会真的结束。"""
+        while True:
+            try:
+                yield from self._blocks_once()
+                return
+            except GeneratorExit:
+                raise
+            except Exception as e:  # noqa: BLE001
+                self.reconnects += 1
+                print(f"[cap] 采集中断（{e}），第 {self.reconnects} 次重连", flush=True)
+                if self.on_reconnect is not None:
+                    try:
+                        self.on_reconnect(self.reconnects)
+                    except Exception:  # noqa: BLE001
+                        pass
+                time.sleep(0.8)
+                try:
+                    self._resolve()
+                    self._use_48k = False       # 新设备可能支持 16k，重新试一次
+                except Exception as e2:  # noqa: BLE001
+                    print(f"[cap] 重新解析设备失败（{e2}）", flush=True)
+                    time.sleep(1.5)
 
     def calibrate(self, seconds=1.0):
         """测一段环境噪声，把门限设在噪声的 2.2 倍。"""
@@ -83,20 +119,25 @@ class Loopback:
         print(f"[cap] 设备={self.name} 底噪={noise:.4f} 门限={self.threshold:.4f}", flush=True)
         return noise
 
-    def _push_floor(self, rms):
-        """滚动跟踪底噪：取最近 6 秒的 20 分位，小声说话也能被识别。"""
+    def _push_floor(self, rms, active=False):
+        """滚动跟踪底噪：取最近 6 秒的 20 分位，小声说话也能被识别。
+
+        说话期间不采样：否则长句会把底噪一起抬上去，后半句被吃掉。
+        """
+        if active:
+            return
         self._hist.append(rms)
         if len(self._hist) >= 12:
             s = sorted(self._hist)
             self._floor = max(0.0010, s[int(len(s) * 0.2)])
             self.threshold = max(0.0022, self._floor * 2.2)
 
-    def segments(self, min_len=0.55, tail=0.30, max_len=9.0,
-                 min_voiced=0.30, min_ratio=0.22):
+    def segments(self, min_len=0.50, tail=0.30, max_len=9.0,
+                 min_voiced=0.22, min_ratio=0.16):
         """按能量切句（带迟滞），并且只交付「确实有人在说话」的片段。
 
         - 门限随底噪自适应，声音小也能进来
-        - 迟滞：起振用 1.25 倍门限，维持用 0.75 倍，避免小声被切断
+        - 迟滞：起振用 1.15 倍门限，维持用 0.62 倍，避免小声被切断
         - 静音片段送进 Whisper 会瞎编（you / thank you），必须挡掉
         """
         buf, tags = [], []
@@ -106,7 +147,12 @@ class Loopback:
         for block in self.blocks():
             rms = block_level(block)
             self.rms = rms
-            self._push_floor(rms)
+            self._push_floor(rms, active)
+            if self.on_level is not None:
+                try:
+                    self.on_level(rms)
+                except Exception:  # noqa: BLE001
+                    pass
             hi = self.threshold * 1.15
             lo = self.threshold * 0.62
             if not active and rms > hi:
@@ -124,6 +170,12 @@ class Loopback:
                 silence_time += blk
 
             total = len(buf) * blk
+            # 说话前的长静音不进片段：否则一句 0.25 秒的「Yes」会被开头的静音
+            # 稀释掉（voiced/total 太小），直接整句丢弃。
+            if not active and voiced_time == 0.0 and silence_time >= 0.5:
+                buf, tags = [], []
+                silence_time = 0.0
+                continue
             if (total >= min_len and silence_time >= tail) or total >= max_len:
                 if voiced_time >= min_voiced and voiced_time / total >= min_ratio:
                     seg = self._trim(buf, tags)
