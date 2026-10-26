@@ -21,7 +21,28 @@
 |---|---|
 | ![full](docs/screenshot-dark.png) | ![minimal](docs/screenshot-minimal.png) |
 
-## 安装
+## 下载（推荐，不用装 Python）
+
+[**Releases v1.0.0**](https://github.com/linyanquan2026-hub/llyq/releases/tag/v1.0.0) — Windows 离线整包，2.7 GB，解压即用。
+
+1. 把两个分卷都下载下来（**缺一个解不开**）：
+   - `LiveTranslate-v1.0.0.7z.001`（1.66 GB）
+   - `LiveTranslate-v1.0.0.7z.002`（1.01 GB）
+2. 放进同一个文件夹，用 7-Zip 或 WinRAR 右键点 **.001** 解压（`.002` 不用管）
+3. 进 `LiveTranslate` 文件夹，双击 `LiveTranslate.exe`
+4. 首次启动约 10 秒把模型搬进显存，左边状态灯变绿「监听中」就能放英文视频了
+
+SHA256（可选，校验用）：
+
+```
+02DAE5887E6EF0D0CC0E7B3D492FEF7D106920C6C324B5E0819C1A78DEA13E3C  LiveTranslate-v1.0.0.7z.001
+C676CCB4B47FD2BD2CC357DC565326428E09689658925554FEC6F19281D60F2B  LiveTranslate-v1.0.0.7z.002
+```
+
+包内含：程序本体、识别模型（faster-whisper small.en）、翻译模型（Qwen2.5-3B q4_0）、llama-server（Vulkan + CPU 两版）、Python 运行时。
+不写注册表，删文件夹即卸载。
+
+## 安装（从源码，开发者）
 
 需要 Windows 10/11 + Python 3.10+。
 
@@ -116,3 +137,4 @@ python -m PyInstaller --noconfirm --clean --onedir --noconsole --name LiveTransl
 ## License
 
 MIT
+
