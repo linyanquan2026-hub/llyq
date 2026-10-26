@@ -23,18 +23,24 @@
 
 ## 下载（推荐，不用装 Python）
 
-[**Releases v1.0.0**](https://github.com/linyanquan2026-hub/llyq/releases/tag/v1.0.0) — Windows 精简包，**247 MB**。
+[Releases v1.0.0](https://github.com/linyanquan2026-hub/llyq/releases/tag/v1.0.0) — Windows 精简包，两卷共 83 MB。
 
-1. 6 个分卷全部下载（缺一个解不开）
-2. 放进同一个文件夹，用 7-Zip / WinRAR 右键点 **.001** 解压
-3. 进 `LiveTranslate` 文件夹，双击 `LiveTranslate.exe`
-4. **第一次启动会自动下载模型**（约 2.33 GB，四分钟左右，只下一次），之后完全离线
+1. 两个分卷都下载（缺一个解不开）
+2. 放同一个文件夹，用 7-Zip 或 WinRAR 右键点 .001 解压
+3. 进 LiveTranslate 文件夹，双击 LiveTranslate.exe
+4. 第一次启动自动下模型（约 2.33 GB，4–6 分钟，只下一次），下完完全离线
 
 注意：
-- 解压到普通目录（如 `D:\LiveTranslate`），别放 `C:\Program Files`
-- 首次启动需要联网（模型从 ModelScope 下）；下完可以断网
-- 手动触发模型下载：`LiveTranslate.exe --download-models`
-- 自检（逐个按钮点一遍并计时）：`LiveTranslate.exe --selftest`
+
+- 解压到普通目录（如 D:\LiveTranslate），别放 C:\Program Files
+- 首次启动需要联网（模型从 ModelScope 下，实测 10 MB/s）；下载中断下次会续传
+- 手动触发模型下载：LiveTranslate.exe --download-models
+- 自检：LiveTranslate.exe --selftest
+
+SHA256（可选，校验用）：
+
+LiveTranslate-lite-v1.0.0.7z.001 7F7FE8F5C608A7BC1B28D080519B47F7F2C60F319657570683457D1A9FFAFDAB
+LiveTranslate-lite-v1.0.0.7z.002 5C00E61A1A6F13149A5998214E2486A0DFA0AE48DB82AE38A96178DA19CA5A60
 
 ## 安装（从源码，开发者）
 
@@ -131,5 +137,6 @@ python -m PyInstaller --noconfirm --clean --onedir --noconsole --name LiveTransl
 ## License
 
 MIT
+
 
 
