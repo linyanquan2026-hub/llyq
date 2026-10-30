@@ -26,6 +26,9 @@ DEFAULTS = {
     "history": 6,        # 字幕历史保留条数
     "asr_threads": 6,
     "mt_threads": 6,
+    "word_mode": True,   # 逐词模式：说一个词就出译文（False = 老的一整句才翻）
+    "word_tick": 0.45,   # 流式识别间隔（秒），越小越跟手，CPU 压力越大
+    "word_delta": False, # True=逐词拼接（只增不改，中文生硬）；False=整句重译（通顺）
 }
 
 
