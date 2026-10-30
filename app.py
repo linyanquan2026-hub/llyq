@@ -776,6 +776,9 @@ class Pipeline:
         self.mt = None
         self.seg_q = queue.Queue(maxsize=3)     # 识别积压最多 3 句
         self.txt_q = queue.Queue(maxsize=1)     # 待翻译只留最新一句
+        self.snap_q = queue.Queue(maxsize=1)    # 流式：只留最新音频快照
+        self.dz_q = queue.Queue(maxsize=1)      # 流式：只留最新增量任务
+        self.stream = None
         self._stop = False
         self._last = ""
         self._pending = ""
@@ -829,7 +832,14 @@ class Pipeline:
 
             self.status("监听中", C_OK, f"{self.cap.name}  ·  模型就绪")
             self.stat(state="采集中", asr=None, mt=None)
-            for fn in (self._cap_loop, self._asr_loop, self._mt_loop):
+            if bool(self.cfg.get("word_mode", True)):
+                self.stream = engine.StreamAsr(self.asr)
+                print("[pipe] 逐词模式：说一个词就出译文", flush=True)
+                loops = (self._live_cap_loop, self._live_asr_loop, self._live_mt_loop)
+            else:
+                print("[pipe] 整句模式：一句话说完才翻", flush=True)
+                loops = (self._cap_loop, self._asr_loop, self._mt_loop)
+            for fn in loops:
                 threading.Thread(target=fn, daemon=True).start()
         except Exception as e:  # noqa: BLE001
             import traceback
@@ -935,6 +945,131 @@ class Pipeline:
                 continue
             self.q.put(("pair", text, zh, cost))
 
+    # -------------------------------------------------------------- 逐词流式
+    def _live_cap_loop(self):
+        """采集：说话期间不停交付「到目前为止」的音频快照，不等句子结束。"""
+        tick = float(self.cfg.get("word_tick", 0.45) or 0.45)
+        try:
+            for audio, final in self.cap.snapshots(tick=tick):
+                if self._stop:
+                    return
+                item = (audio, final, time.time())
+                if final:                       # 收尾的那一版绝不能丢
+                    try:
+                        while True:
+                            self.snap_q.get_nowait()
+                    except queue.Empty:
+                        pass
+                    self.snap_q.put(item)
+                elif push_latest(self.snap_q, item):
+                    self._drop += 1
+                    self.stat(drop=self._drop)
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            self.q.put(("msg", f"采集出错：{e}"))
+            self.status("采集异常", C_ERR)
+
+    def _live_asr_loop(self):
+        """识别：每个快照解一次，两次解码都稳定的词才提交（LocalAgreement-2）。"""
+        while not self._stop:
+            try:
+                audio, final, ts = self.snap_q.get(timeout=0.5)
+            except queue.Empty:
+                self.stat(qs=0)
+                continue
+            t0 = time.time()
+            try:
+                delta = self.stream.feed(audio, final=final)
+            except Exception as e:  # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                self.q.put(("msg", f"识别失败：{e}"))
+                continue
+            cost = time.time() - t0
+            self.stat(state="识别", asr=cost, qs=self.snap_q.qsize())
+            if delta:
+                print(f"[dbg] asr={cost:.2f}s 新增={delta!r} 全句={self.stream.text!r}",
+                      flush=True)
+            if not delta and not final:
+                continue
+            job = ("final" if final else "delta", self.stream.text, delta, ts)
+            if final:
+                self.stream.reset()
+            push_latest(self.dz_q, job)
+
+    def _live_mt_loop(self):
+        """翻译：说话过程中不停重译「已确认的全部词」，整句说完再定稿一次。
+
+        两种拼法，config 里 word_delta 切换：
+        - False（默认）整句重译：每次都把当前这句英文重译一遍，中文通顺，
+          个别词会被改写，字幕轻微跳动；
+        - True 逐词拼接：只译新增的词再追加，字幕只增不改，但拼出来的中文生硬。
+        """
+        stitch = bool(self.cfg.get("word_delta", False))
+        zh_done = ""
+        last_en = ""
+        while not self._stop:
+            try:
+                kind, en, delta, ts = self.dz_q.get(timeout=0.5)
+            except queue.Empty:
+                self.stat(qm=0)
+                continue
+            self.stat(state="翻译", qm=self.dz_q.qsize())
+            if kind == "delta":
+                if not delta:
+                    continue
+                whole = en.strip()
+                if not whole or whole == last_en:
+                    continue
+                try:
+                    if stitch:
+                        zh = self.mt.translate_delta(delta, last_en, zh_done)
+                        if not zh:
+                            continue
+                        zh_done = (zh_done + zh).strip()
+                        self.q.put(("partial", zh_done))
+                    else:
+                        zh_done = self.mt.translate(
+                            whole, on_partial=lambda t: self.q.put(("partial", t)))
+                except Exception as e:  # noqa: BLE001
+                    import traceback
+                    traceback.print_exc()
+                    self.q.put(("msg", f"翻译服务异常：{e}"))
+                    self.status("翻译服务断开，重连中", C_ERR)
+                    if self.mt.ensure_alive():
+                        self.status("监听中", C_OK, f"{self.cap.name}  ·  已重连")
+                    else:
+                        self.status("翻译服务丢失", C_ERR)
+                    continue
+                last_en = whole
+                self.stat(state="监听中", mt=time.time() - ts)
+                continue
+
+            # 收尾：整句重译，去掉逐词阶段可能残留的生硬语序
+            last_en = ""
+            zh_done = ""
+            text = en.strip()
+            if not text:
+                continue
+            try:
+                zh2 = self.mt.translate(text, on_partial=lambda t: self.q.put(("partial", t)))
+            except Exception as e:  # noqa: BLE001
+                import traceback
+                traceback.print_exc()
+                self.q.put(("msg", f"翻译服务异常：{e}"))
+                self.status("翻译服务断开，重连中", C_ERR)
+                if self.mt.ensure_alive():
+                    self.status("监听中", C_OK, f"{self.cap.name}  ·  已重连")
+                else:
+                    self.status("翻译服务丢失", C_ERR)
+                continue
+            cost = time.time() - ts
+            print(f"[zh] {zh2}   ({cost:.2f}s, 逐词)", flush=True)
+            self.stat(state="监听中", mt=cost, qm=self.dz_q.qsize())
+            if zh2:
+                self.q.put(("pair", text, zh2, cost))
+
     # -------------------------------------------------------------- 退出
     def stop(self):
         self._stop = True
@@ -993,7 +1128,8 @@ def main():
 
     cfg = config.load()
     print(f"[cfg] 载入 字号={cfg['font_zh']}/{cfg['font_en']} 双语={cfg['bilingual']} "
-          f"文字模式={cfg['minimal']} 位置={cfg['pos']} ← {config.path()}", flush=True)
+          f"文字模式={cfg['minimal']} 逐词={cfg.get('word_mode', True)} "
+          f"位置={cfg['pos']} ← {config.path()}", flush=True)
     q = queue.Queue()
     ov = Overlay(q, cfg)
     print("[ui] 窗口已建，开始起流水线", flush=True)
