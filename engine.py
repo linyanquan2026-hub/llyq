@@ -52,9 +52,17 @@ def _collapse(s: str) -> str:
     return s
 
 
+def _norm_word(w: str) -> str:
+    """比对用：去掉标点、统一小写，比较两个假设里的同一个词。"""
+    return re.sub(r"[^a-z0-9']", "", w.lower())
+
+
 class Asr:
-    def __init__(self, model="small.en", threads=6):
+    def __init__(self, model="small.en", threads=6, fast="tiny.en"):
         from faster_whisper import WhisperModel
+        self._threads = threads
+        self._fast_name = fast
+        self._fast = None
         t0 = time.time()
         local = os.path.join(MODELS, "whisper_ct2")
         if os.path.exists(os.path.join(local, "model.bin")):
@@ -68,6 +76,32 @@ class Asr:
                 download_root=os.path.join(MODELS, "whisper"),
             )
         print(f"[asr] 就绪 {time.time() - t0:.1f}s", flush=True)
+
+    def _fast_model(self):
+        """流式专用的快模型 tiny.en：2 秒音频 0.2 秒出结果。
+
+        small.en 解一次固定要 1.5 秒（Whisper 编码器固定吃 30 秒窗口，跟音频
+        长短无关），当流式用就永远慢一拍。逐词阶段用 tiny 判断「词来了」，
+        整句收尾再交给 small.en 出准确文本——两层各干各擅长的事。
+        """
+        if self._fast is not None:
+            return self._fast
+        from faster_whisper import WhisperModel
+        local = os.path.join(MODELS, "whisper_tiny_ct2")
+        try:
+            t0 = time.time()
+            if os.path.exists(os.path.join(local, "model.bin")):
+                self._fast = WhisperModel(local, device="cpu", compute_type="int8",
+                                          cpu_threads=self._threads)
+            else:
+                self._fast = WhisperModel(self._fast_name, device="cpu", compute_type="int8",
+                                          cpu_threads=self._threads,
+                                          download_root=os.path.join(MODELS, "whisper"))
+            print(f"[asr] 快模型就绪 {time.time() - t0:.1f}s", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[asr] 快模型不可用（{e}），流式退回 small", flush=True)
+            self._fast = self.model
+        return self._fast
 
     def listen(self, audio: np.ndarray, sr: int = 16000) -> str:
         audio = np.asarray(audio, dtype=np.float32).flatten()
@@ -99,12 +133,111 @@ class Asr:
             parts.append(t)
         return " ".join(parts).strip()
 
+    def snapshot(self, audio: np.ndarray, final: bool = False) -> str:
+        """流式识别：允许很短的碎片（单个词），但要挡掉 Whisper 的经典幻觉。
+
+        和 listen() 的差别：
+        - 门槛放宽到 1~2 个字母，否则「Yes / No / Go」这种一个词的永远出不来；
+        - 收尾（final）更松，句中更严，避免半句话被瞎猜；
+        - 依然用 beam_size=1 + temperature=0，保证短音频也快。
+        """
+        audio = np.asarray(audio, dtype=np.float32).flatten()
+        if audio.size < int(16000 * 0.18):
+            return ""
+        model = self.model if final else self._fast_model()
+        segs, _ = model.transcribe(
+            audio,
+            language="en",
+            beam_size=1,
+            best_of=1,
+            temperature=0.0,
+            condition_on_previous_text=False,
+            vad_filter=False,
+            without_timestamps=True,
+        )
+        parts = []
+        for s in segs:
+            if getattr(s, "no_speech_prob", 0.0) > (0.55 if final else 0.62):
+                continue
+            if getattr(s, "avg_logprob", 0.0) < (-1.15 if final else -1.30):
+                continue
+            t = s.text.strip()
+            if not t:
+                continue
+            if t.lower().strip(" .!?,") in _HALLU:
+                continue
+            if len(re.findall(r"[A-Za-z]", t)) < (1 if final else 2):
+                continue
+            parts.append(t)
+        return " ".join(parts).strip()
+
+
+class StreamAsr:
+    """快照流 → 稳定文本：两次解码都同意的词才上屏（LocalAgreement-2）。
+
+    为什么要这个：流式识别每一版假设都可能变（后文会改写前文）。把「连续
+    两次解码在同一位置出现同样的词」当作稳定信号，词一稳定就立刻交给翻译，
+    于是说一个词也能马上出译文，而不会来回闪烁。
+    """
+
+    def __init__(self, asr: Asr):
+        self.asr = asr
+        self.words = []
+        self._last = []
+
+    def reset(self):
+        self.words = []
+        self._last = []
+
+    @property
+    def text(self) -> str:
+        return " ".join(self.words)
+
+    def feed(self, audio, final: bool = False) -> str:
+        """吃一个音频快照，返回本次新确认的词（可能为空字符串）。
+
+        final 时用 small.en 把整句重新解一遍，直接覆盖逐词拼出来的文本——
+        tiny 认不准的词（比如把 very 听成 very...）在这一步被纠正，
+        交给翻译的就是干净的一句。
+        """
+        if final:
+            full = self.asr.snapshot(audio, final=True)
+            if full:
+                self.words = full.split()
+                self._last = list(self.words)
+                return ""
+        hyp = self.asr.snapshot(audio, final=final)
+        if not hyp:
+            return ""
+        cur = hyp.split()
+        # 与上一次解码求词级公共前缀
+        n = 0
+        for a, b in zip(self._last, cur):
+            if _norm_word(a) and _norm_word(a) == _norm_word(b):
+                n += 1
+            else:
+                break
+        added = []
+        if n > len(self.words):
+            added = cur[len(self.words):n]           # 两次都同意的部分，稳定
+        elif final and len(cur) > len(self.words):
+            added = cur[len(self.words):]            # 收尾不再等第二次解码
+        if added:
+            self.words.extend(added)
+        self._last = cur
+        return " ".join(added)
+
 
 SYS_PROMPT = (
     "你是专业的英译中字幕翻译。规则："
     "1) 全部译成简体中文，译文中禁止出现英文单词；"
     "2) 口语、俚语、粗话译成对应的中文口语，不要直译；"
     "3) 只输出译文，不要解释、不要加引号。"
+)
+
+DELTA_SYS = (
+    "你是英译中字幕翻译器。只把「新片段」译成简体中文："
+    "不要重复上文已经译过的内容，不要解释，不要加引号，只输出新片段的译文。"
 )
 
 
@@ -230,13 +363,17 @@ class Mt:
 
     def _ask(self, text, strict=False, on_partial=None):
         """请求翻译。给了 on_partial 就走流式，边生成边回调（首字约 0.3 秒上屏）。"""
-        import json
         sys_prompt = SYS_PROMPT + ("译文里出现任何英文字母都算错。" if strict else "")
+        return self._ask_raw(sys_prompt, text, max_tokens=200, on_partial=on_partial)
+
+    def _ask_raw(self, sys_prompt, user, max_tokens=200, on_partial=None):
+        """裸请求：自定义 system + user，逐词增量翻译走这里。"""
+        import json
         stream = on_partial is not None
         body = json.dumps({
             "messages": [{"role": "system", "content": sys_prompt},
-                         {"role": "user", "content": text}],
-            "max_tokens": 200, "temperature": 0.2, "stream": stream,
+                         {"role": "user", "content": user}],
+            "max_tokens": max_tokens, "temperature": 0.2, "stream": stream,
         }).encode()
         req = self._urllib.Request(self._url(self.port, "/v1/chat/completions"), data=body,
                                    headers={"Content-Type": "application/json"})
@@ -289,4 +426,44 @@ class Mt:
                     return out2
             except Exception:  # noqa: BLE001
                 pass
+        return out
+
+    def translate_delta(self, new_en: str, en_ctx: str = "", zh_ctx: str = "") -> str:
+        """逐词增量翻译：只译新增的词，靠上文保住连贯。
+
+        max_tokens 只有 48——一个词最多几个汉字，限制长度能让首字更快回来，
+        也顺手防止模型借机把整句重写一遍。
+        """
+        new_en = new_en.strip()
+        if not new_en:
+            return ""
+        if not zh_ctx:
+            return self.translate(new_en)
+        user = f"上文英文：{en_ctx}\n上文译文：{zh_ctx}\n新片段：{new_en}"
+        try:
+            out = _clean_zh(self._ask_raw(DELTA_SYS, user, max_tokens=48))
+        except Exception as e:  # noqa: BLE001
+            print(f"[mt] 增量翻译失败（{e}），重连后重试", flush=True)
+            if not self.ensure_alive():
+                raise
+            out = _clean_zh(self._ask_raw(DELTA_SYS, user, max_tokens=48))
+        # 模型偶尔会把上文的尾巴一起复述，切掉重复
+        tail = zh_ctx[-6:]
+        if out and tail and out.startswith(tail):
+            out = out[len(tail):].lstrip("，。、；： ")
+        # 整段把上文重说一遍 / 完全等于已显示的尾巴：丢掉，逐词拼接最怕
+        # 「是是」「的的」和整句重复
+        if out and ((zh_ctx and (out in zh_ctx or zh_ctx.endswith(out)))):
+            return ""
+        # 还蹦出英文（小模型喂进来的词它没译），换严格提示再问，最后退回整句翻译
+        if re.search(r"[A-Za-z]{2,}", out):
+            try:
+                strict = _clean_zh(self._ask_raw(DELTA_SYS + "译文里禁止出现英文单词。",
+                                                 user, max_tokens=48))
+            except Exception:  # noqa: BLE001
+                strict = ""
+            if strict and not re.search(r"[A-Za-z]{2,}", strict):
+                out = strict
+            else:
+                out = self.translate(new_en)
         return out
