@@ -184,6 +184,70 @@ class Loopback:
                 buf, tags, voiced_time, silence_time = [], [], 0.0, 0.0
                 active = False
 
+    def snapshots(self, tick=0.35, tail=0.45, max_len=5.0,
+                  min_voiced=0.10, min_ratio=0.10):
+        """流式快照：说话期间每 tick 秒交付「这句话到目前为止」的音频。
+
+        yield (audio, final)
+          final=False  说话中的中间快照，上层拿去做增量识别（说一个词也能出）
+          final=True   停顿超过 tail、或说满 max_len，本句收尾
+
+        与 segments() 的区别：不等一句话说完才交付。纯静音不产出任何快照，
+        免得把静音送进 Whisper 让它编词。
+        """
+        buf, tags = [], []
+        voiced_time = 0.0
+        silence_time = 0.0
+        active = False
+        last_emit = 0.0
+        for block in self.blocks():
+            rms = block_level(block)
+            self.rms = rms
+            self._push_floor(rms, active)
+            if self.on_level is not None:
+                try:
+                    self.on_level(rms)
+                except Exception:  # noqa: BLE001
+                    pass
+            hi = self.threshold * 1.15
+            lo = self.threshold * 0.62
+            if not active and rms > hi:
+                active = True
+            elif active and rms < lo:
+                active = False
+            is_voiced = active
+            buf.append(block)
+            tags.append(is_voiced)
+            blk = len(block) / SR
+            if is_voiced:
+                voiced_time += blk
+                silence_time = 0.0
+            else:
+                silence_time += blk
+
+            total = len(buf) * blk
+            if not active and voiced_time == 0.0 and silence_time >= 0.5:
+                buf, tags = [], []
+                silence_time = 0.0
+                last_emit = 0.0
+                continue
+
+            if active and voiced_time >= min_voiced and (total - last_emit) >= tick:
+                seg = self._trim(buf, tags)
+                if seg is not None:
+                    last_emit = total
+                    yield self._normalize(seg), False
+
+            if (voiced_time > 0 and silence_time >= tail) or total >= max_len:
+                if voiced_time >= min_voiced and voiced_time / max(total, 1e-6) >= min_ratio:
+                    seg = self._trim(buf, tags)
+                    if seg is not None:
+                        yield self._normalize(seg), True
+                buf, tags = [], []
+                voiced_time = silence_time = 0.0
+                last_emit = 0.0
+                active = False
+
     @staticmethod
     def _normalize(seg, target=0.85, floor=0.004, max_gain=20.0):
         """声音小的时候拉一把音量（最高 +26dB）。
