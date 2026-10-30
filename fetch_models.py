@@ -19,19 +19,28 @@ SPECS = [
     ("systran/faster-whisper-small.en", "whisper_ct2",
      ["config.json", "model.bin", "tokenizer.json", "vocabulary.txt"],
      484 * 1024 * 1024),
+    # 逐词模式的快模型：只用来判断「词来了」，整句收尾仍用 small.en
+    ("systran/faster-whisper-tiny.en", "whisper_tiny_ct2",
+     ["config.json", "model.bin", "tokenizer.json", "vocabulary.txt"],
+     78 * 1024 * 1024),
     ("Qwen/Qwen2.5-3B-Instruct-GGUF", "qwen",
      ["qwen2.5-3b-instruct-q4_0.gguf"],
      1905 * 1024 * 1024),
 ]
 
-MIN_SIZE = {"model.bin": 400 << 20, "qwen2.5-3b-instruct-q4_0.gguf": 1500 << 20}
+# 键写成「子目录/文件名」：两个 whisper 模型都有 model.bin，不能只按文件名卡大小
+MIN_SIZE = {
+    "whisper_ct2/model.bin": 400 << 20,
+    "whisper_tiny_ct2/model.bin": 50 << 20,
+    "qwen/qwen2.5-3b-instruct-q4_0.gguf": 1500 << 20,
+}
 
 
-def _ok(path, name):
+def _ok(path, name, sub=""):
     """文件在、而且不是个半截货（模型文件按已知大小卡一下）。"""
     if not os.path.exists(path) or os.path.getsize(path) == 0:
         return False
-    need = MIN_SIZE.get(name)
+    need = MIN_SIZE.get(f"{sub}/{name}" if sub else name)
     return True if need is None else os.path.getsize(path) >= need
 
 
@@ -40,7 +49,7 @@ def missing(models_dir):
     out = []
     for repo, sub, files, approx in SPECS:
         d = os.path.join(models_dir, sub)
-        lack = [f for f in files if not _ok(os.path.join(d, f), f)]
+        lack = [f for f in files if not _ok(os.path.join(d, f), f, sub)]
         if lack:
             out.append({"repo": repo, "sub": sub, "files": lack, "bytes": approx})
     return out
