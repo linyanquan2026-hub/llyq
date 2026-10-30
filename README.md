@@ -1,142 +1,88 @@
-# LiveTranslate · 实时翻译字幕
+# 实时翻译字幕（全离线）
 
-把电脑正在播放的**英文声音**抓下来，实时识别并翻成中文，以悬浮字幕的形式显示在屏幕底部。
+把电脑正在播放的**英文声音**抓下来，实时识别并翻成中文，显示在屏幕下方的悬浮字幕条上。
 
-**全离线**：不联网、不花钱、声音不出本机。识别和翻译都在本机跑。
-
-![界面](docs/screenshot-dark.png)
-
-## 特性
-
-- **抓系统声音**（WASAPI 回环），不是麦克风——看视频、开会、打游戏都能用
-- **全离线**：Whisper small.en 识别 + Qwen2.5-3B 翻译，全程本地
-- **快**：一句说完到出中文字幕约 1.6–2.0 秒（翻译走显卡时首字 0.12 秒）
-- **小声也能听到**：底噪自适应 + 迟滞 + 块内峰值 + 自动增益（最高 +26dB），系统音量 6% 仍可识别
-- **两种界面**：完整面板（状态/音量/句数/耗时）和纯文字模式（F4，只留字幕）
-- **鼠标穿透**（F3），全屏看视频时不挡操作
-
-## 界面
-
-| 完整模式 | 文字模式（F4） |
-|---|---|
-| ![full](docs/screenshot-dark.png) | ![minimal](docs/screenshot-minimal.png) |
-
-## 下载（推荐，不用装 Python）
-
-[Releases v1.0.0](https://github.com/linyanquan2026-hub/llyq/releases/tag/v1.0.0) — Windows 精简包，两卷共 83 MB。
-
-1. 两个分卷都下载（缺一个解不开）
-2. 放同一个文件夹，用 7-Zip 或 WinRAR 右键点 .001 解压
-3. 进 LiveTranslate 文件夹，双击 LiveTranslate.exe
-4. 第一次启动自动下模型（约 2.33 GB，4–6 分钟，只下一次），下完完全离线
-
-注意：
-
-- 解压到普通目录（如 D:\LiveTranslate），别放 C:\Program Files
-- 首次启动需要联网（模型从 ModelScope 下，实测 10 MB/s）；下载中断下次会续传
-- 手动触发模型下载：LiveTranslate.exe --download-models
-- 自检：LiveTranslate.exe --selftest
-
-SHA256（可选，校验用）：
-
-LiveTranslate-lite-v1.0.0.7z.001 7F7FE8F5C608A7BC1B28D080519B47F7F2C60F319657570683457D1A9FFAFDAB
-LiveTranslate-lite-v1.0.0.7z.002 5C00E61A1A6F13149A5998214E2486A0DFA0AE48DB82AE38A96178DA19CA5A60
-
-## 安装（从源码，开发者）
-
-需要 Windows 10/11 + Python 3.10+。
-
-```powershell
-git clone https://github.com/<你的用户名>/live-translate.git
-cd live-translate
-powershell -ExecutionPolicy Bypass -File setup.ps1
+```
+系统声音(WASAPI 回环) → 流式快照 → Whisper tiny.en(定词) / small.en(定句) → Qwen2.5-3B → 悬浮字幕
+                        能量VAD     两次解码一致才认(LocalAgreement-2)        逐句重译
 ```
 
-`setup.ps1` 会做这些事（一次性）：
+全离线：不联网、不花钱、声音不出本机。
 
-1. 装 Python 依赖（`soundcard`、`faster-whisper` 等）
-2. 从 **ModelScope** 下模型（约 2.4GB）：
-   - `systran/faster-whisper-small.en`（识别，464MB）
-   - `Qwen/Qwen2.5-3B-Instruct-GGUF` q4_0（翻译，1.9GB）
-3. 从 GitHub 下 `llama.cpp` 的 Windows 二进制（Vulkan + CPU 两个版本）
-4. 启动程序
+## 逐词模式（默认开）
+
+不等一句话说完：说话过程中每 0.45 秒把「到目前为止」的音频送去识别一次，
+两次解码都对得上的词立即翻成中文上屏，端到端约 **0.3–0.6 秒**；
+一句说完再用 small.en 重解、整句重译，换成通顺的一整句。
+
+两层模型的原因：small.en 单次解码固定约 1.5 秒（Whisper 编码器固定吃 30 秒窗口，
+跟音频长短无关），拿来做流式永远慢一拍；tiny.en 同样条件只要 0.2 秒。
+
+配置（`%APPDATA%\LiveTranslate\config.json`）：
+
+| 键 | 默认 | 作用 |
+|---|---|---|
+| `word_mode` | `true` | `false` = 退回老的一整句模式 |
+| `word_tick` | `0.45` | 流式识别间隔（秒） |
+| `word_delta` | `false` | `true` = 逐词拼接（只增不改、中文生硬）；默认整句重译（通顺、个别词会改） |
 
 ## 用法
 
-```powershell
-python app.py             # 完整模式
-python app.py --minimal   # 直接进纯文字模式
-```
+**方式一（推荐）**：双击 `dist\LiveTranslate\LiveTranslate.exe`
+**方式二**：双击 `启动.vbs`（走本机 Python，不打包）
 
-| 按键 | 作用 |
-|---|---|
-| `Esc` | 退出 |
-| `F3` | 鼠标穿透开关 |
-| `F4` | 完整模式 ↔ 纯文字模式 |
-| 拖动 | 按住窗口任意位置移动 |
-| 右上角 `✕` | 关闭 |
-| 右上角 `⌄` | 收起成纯文字 |
+- **Esc** 退出
+- **F3** 切换鼠标穿透（穿透后点击落到下面窗口，适合全屏看视频；再按 F3 恢复）
+- 按住字幕条可以拖动
 
-## 架构
+启动到能翻字幕约 6 秒；逐词模式第一个词约 0.5 秒上屏，整句定稿 2 秒内。
+
+## 目录
 
 ```
-系统声音(WASAPI 回环)
-   └─ capture.py   分句：底噪自适应 + 迟滞 + 块内峰值 + 自动增益
-        └─ engine.Asr   faster-whisper small.en（CTranslate2 int8，CPU 6 线程）
-             └─ engine.Mt   Qwen2.5-3B（llama-server 子进程，HTTP + 流式）
-                  └─ app.Overlay   tkinter 悬浮窗，逐字流式上屏
+live-translate\
+  app.py               主程序（悬浮窗 + 调度）
+  capture.py           WASAPI 回环录音 + 能量分句
+  engine.py            Whisper 识别 + Qwen 翻译（HTTP 调 llama-server）
+  download_models.py   从 ModelScope 拉识别模型
+  selftest.py          wav 离线自测
+  selftest_capture.py  回环录音自测
+  models\
+    whisper_ct2\       faster-whisper small.en（CTranslate2，int8，464MB，定句用）
+    whisper_tiny_ct2\  faster-whisper tiny.en（75MB，逐词定词用）
+    qwen\              Qwen2.5-3B-Instruct q4_0 GGUF（1.9GB）
+  llama\               llama.cpp b11887 官方 Windows CPU 二进制
+  tools\               流式自测：stream_check.py（喂 wav）/ stream_live_check.py（真放音）
+  dist\LiveTranslate\  打包好的 exe（模型 + llama 已复制进去，约 2.6GB）
 ```
 
-关键设计：
+## 架构要点
 
-- **翻译走独立进程**：`llama-server.exe` 由程序拉起，HTTP 调用，退出时杀掉。
-  这样不用把 1.9GB 模型塞进 Python 进程，也不会拖慢识别。
-- **优先 Vulkan**：`llama_vk/` 存在就用显卡（首字 0.12s），否则自动退回 CPU 版（1.7s）。
-- **流式翻译**：SSE 逐 token 回调，首字就上屏，不用等整句。
-
-## 性能（Ryzen 5 5600 / RX 7650 GRE）
-
-| 项 | 数值 |
-|---|---|
-| 启动到可用 | 约 10 秒（模型搬进显存） |
-| 识别 | 0.8–1.5 秒/句 |
-| 翻译首字 | 0.12 秒（GPU）/ 1.7 秒（CPU） |
-| 端到端 | 1.6–2.0 秒 |
-| 内存 | 识别 ~350MB + 翻译 ~2.3GB 显存 |
-
-## 打包成 exe
-
-```powershell
-python -m PyInstaller --noconfirm --clean --onedir --noconsole --name LiveTranslate `
-  --exclude-module torch --exclude-module transformers --exclude-module onnxruntime `
-  app.py
-# 然后把 models/ llama/ llama_vk/ 拷进 dist\LiveTranslate\
-```
-
-## 已知限制
-
-- 只翻**英文 → 中文**（换语言见下）
-- 识别错则翻译跟着错（级联误差）
-- 背景音乐/音效大会误触发识别
-- 纯 CPU 时翻译慢 1.5 秒
+- 识别：`faster-whisper`（CTranslate2，int8，CPU）；small.en 单次约 1.5 秒（定句），tiny.en 约 0.2 秒（定词）
+- 定词：`engine.StreamAsr`，两次解码词级公共前缀一致才提交（LocalAgreement-2），避免中间字幕来回改
+- 翻译：**llama-server 子进程 + HTTP**，不是 python 绑定。
+  `Mt.__init__` 会在 8123/8124/8125 上拉起 `llama/llama-server.exe`，等 `/health` 就绪；
+  程序退出时 atexit 杀掉它。
+- 为什么不用 llama-cpp-python：PyPI 没有 Windows 轮子，要本地编译 CMake/MSVC，太脆。
+- 为什么不用 torch 版 OPUS：PyInstaller 分析 transformers 会卡十几分钟，而且包大 700MB。
 
 ## 换语言 / 换模型
 
-- 日文：`engine.Asr.listen` 里 `language="en"` 改 `"ja"`，识别模型换多语种 `small`；翻译模型换 `Helsinki-NLP/opus-mt-ja-zh`
-- 换更大翻译模型：把 `models/qwen` 换成 7B GGUF，改 `engine.Mt` 里的文件名（16GB 内存会紧）
+- 日文：`engine.Asr.listen` 里 `language="en"` → `"ja"`，识别模型换多语种 `small`
+- 换更大模型：把 `models\qwen` 换成 7B GGUF，`engine.Mt.__init__` 里的文件名改一下即可（16GB 内存会紧）
 
-## 踩过的坑
+## 已知限制
 
-1. **HuggingFace 在国内下不动**（大文件被重置，Xet 协议还会卡死）→ 模型全走 **ModelScope**
-2. **PyPI 官方源慢** → 用阿里云镜像
-3. **Whisper 对静音会瞎编**（"you"/"thank you"）→ 必须按有声占比过滤片段，并按 `no_speech_prob`/`avg_logprob` 过滤结果
-4. **门限写死会漏掉小声** → 改成滚动分位数自适应 + 迟滞
-5. **transparentcolor + ClearType 会有彩色毛边** → 文字下面垫一层实色底衬
-6. **PyInstaller 分析 transformers 会卡十几分钟** → 本项目最终不用 torch/transformers，绕开了
+- 只翻**英文→中文**
+- 识别错 → 翻译跟着错（这是级联误差，改不了，只能换更大的识别模型）
+- 背景音乐大时会误触发识别
+- 纯 CPU：识别占 2–3 核，翻译再占 2–3 核
 
-## License
+## 踩过的坑（改代码前先看）
 
-MIT
-
-
-
+1. `pypi.org` / 清华源在这台机器上不通，用**阿里云源**；HuggingFace 大文件会被重置，模型走 **ModelScope**
+2. huggingface_hub 的 Xet 协议在镜像上会卡死 → `HF_HUB_DISABLE_XET=1`
+3. Whisper 对**静音片段会瞎编**（"you"/"thank you"）→ 分句按"有声占比"过滤，识别结果按 `no_speech_prob`/`avg_logprob` 过滤
+4. PyInstaller 打包前**必须关掉正在跑的 exe**，否则 `_internal` 被锁，构建报 PermissionError，dist 里留着旧版
+5. CT2 转换版 Marian（opus_en_zh_ct2）能跑但**译文退化成重复字**，已弃用
+6. 重新打包后 models/ 和 llama/ 会被清掉，要重新拷进 `dist\LiveTranslate\`
